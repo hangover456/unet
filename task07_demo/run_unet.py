@@ -31,12 +31,22 @@ def loss(logits,y):
     dice=(2*(probs*gt).sum((0,2,3))+1e-5)/(probs.sum((0,2,3))+gt.sum((0,2,3))+1e-5)
     return F.cross_entropy(logits.float(),y)+(1-dice[1:].mean())
 
+def require_finite(value, name):
+    if not torch.isfinite(value).all():
+        raise RuntimeError(f'Non-finite {name}; stopping before an unsafe optimizer update.')
+
+def clip_gradients(net):
+    # Abort on overflow before modifying weights; never silently zero bad gradients.
+    return torch.nn.utils.clip_grad_norm_(net.parameters(),1.0,error_if_nonfinite=True)
+
 def train(a):
     cache=a.work/'unet_cache';contract=read_json(cache/'contract.json')
     if contract['source']!=str(a.data) or contract['split']!=SPLIT:raise ValueError('Wrong preprocessing contract')
     def data(group):
         chunks=[np.load(cache/f'{c}.npz') for c in SPLIT[group]]
-        return np.concatenate([p['x'] for p in chunks]),np.concatenate([p['y'] for p in chunks])
+        x,y=np.concatenate([p['x'] for p in chunks]),np.concatenate([p['y'] for p in chunks])
+        if not np.isfinite(x).all() or not np.isin(y,[0,1,2]).all():raise ValueError('Invalid cached images or labels; rebuild preprocessing.')
+        return x,y
     tr,va=data('train'),data('val');rng=np.random.default_rng(42)
     def batch(data):
         x,y=data
@@ -44,31 +54,34 @@ def train(a):
         pos=np.flatnonzero((y>0).any((1,2)))
         ids=[int(rng.choice(pos)) if len(pos) and rng.random()<.67 else int(rng.integers(len(y))) for _ in range(2)]
         return torch.from_numpy(x[ids].astype(np.float32)).cuda(),torch.from_numpy(y[ids].astype(np.int64)).cuda()
-    net=UNet2D().cuda();opt=torch.optim.Adam(net.parameters(),lr=1e-3);scaler=torch.amp.GradScaler('cuda')
+    # This unnormalized plain U-Net reproduced fp16 forward overflow at batch 239.
+    # Keep the architecture unchanged, use FP32 for train/validation/inference.
+    net=UNet2D().cuda();opt=torch.optim.Adam(net.parameters(),lr=1e-4)
+    write_json(a.run_dir/'training_settings.json',{'precision':'float32','optimizer':'Adam','initial_lr':1e-4,
+        'max_gradient_norm':1.0,'architecture':'unchanged UNet2D width32','reason':'avoid reproduced fp16 forward overflow'})
     history=[];best=-1.;updates=0;start=time.perf_counter()
     try:
         for epoch in range(a.max_epochs):
-            net.train();ls=[]
+            net.train();ls=[];norms=[]
             for _ in range(a.steps):
                 x,y=batch(tr)
                 if rng.random()<.5:x,y=x.flip(-1),y.flip(-1)
                 opt.zero_grad(set_to_none=True)
-                with torch.autocast('cuda'):v=loss(net(x),y)
-                if not torch.isfinite(v):raise RuntimeError('Non-finite training loss')
-                scaler.scale(v).backward();scaler.unscale_(opt);torch.nn.utils.clip_grad_norm_(net.parameters(),12)
-                scaler.step(opt);scaler.update();updates+=1;ls.append(v.item())
+                logits=net(x);require_finite(logits,'training logits');v=loss(logits,y);require_finite(v,'training loss')
+                v.backward();gn=clip_gradients(net);opt.step();updates+=1;ls.append(v.item());norms.append(gn.item())
                 if time.perf_counter()-start>=a.minutes*60:break
             net.eval();vl=[];ds=[]
             with torch.no_grad():
                 for _ in range(a.val_steps):
                     x,y=batch(va)
-                    with torch.autocast('cuda'):out=net(x);v=loss(out,y)
+                    out=net(x);require_finite(out,'validation logits');v=loss(out,y);require_finite(v,'validation loss')
                     pred=out.argmax(1);scores=[]
                     for k in (1,2):
                         gt,pr=y==k,pred==k;den=(gt.sum()+pr.sum()).item()
                         if den:scores.append(float((2*(gt&pr).sum()).item()/den))
                     vl.append(v.item());ds.append(float(np.mean(scores)) if scores else 1.)
-            row=dict(epoch=epoch+1,train_loss=float(np.mean(ls)),val_loss=float(np.mean(vl)),patch_dice=float(np.mean(ds)),seconds=time.perf_counter()-start)
+            row=dict(epoch=epoch+1,train_loss=float(np.mean(ls)),val_loss=float(np.mean(vl)),patch_dice=float(np.mean(ds)),
+                     gradient_norm_before_clip=float(np.mean(norms)),seconds=time.perf_counter()-start)
             history.append(row);write_json(a.run_dir/'history.json',history);print(row,flush=True)
             ck={'state_dict':net.state_dict(),'epoch':epoch+1,'classes':3,'base_width':32,'input_channels':1,'window':[-100,240],'input_size':256,'split':SPLIT}
             torch.save(ck,a.run_dir/'checkpoint_latest.pth')
@@ -83,7 +96,7 @@ def train(a):
         'stop_reason':'time_budget' if time.perf_counter()-start>=a.minutes*60 else 'max_epochs','best_sampled_patch_dice':best,
         'checkpoint_final_sha256':sha(a.run_dir/'checkpoint_final.pth'),
         'parameter_count':sum(p.numel() for p in net.parameters()),'peak_gpu_memory_bytes':torch.cuda.max_memory_allocated(),
-        'optimizer':'Adam','initial_lr':1e-3,'loss':'cross entropy + foreground soft Dice',
+        'optimizer':'Adam','initial_lr':1e-4,'precision':'float32','max_gradient_norm':1.0,'loss':'cross entropy + foreground soft Dice',
         'model':'PyTorch U-Net 2D, width32, 3 classes; adapted from legacy architecture, not weight compatible'})
 
 def predict(a):
@@ -95,7 +108,7 @@ def predict(a):
             im=nib.load(a.data/'imagesTr'/f'pancreas_{case}.nii.gz');x=np.asarray(im.dataobj,dtype=np.float32);pred=np.empty(x.shape,dtype=np.uint8)
             for z in range(0,x.shape[2],4):
                 batch=torch.from_numpy(normalize(x[:,:,z:z+4]).transpose(2,0,1).copy())[:,None].cuda()
-                with torch.autocast('cuda'):logits=net(resize(batch))
+                logits=net(resize(batch));require_finite(logits,'inference logits')
                 labels=resize(logits.float(),size=x.shape[:2]).argmax(1).cpu().numpy().astype(np.uint8)
                 pred[:,:,z:z+4]=labels.transpose(1,2,0)
             h=im.header.copy();h.set_data_dtype(np.uint8);nib.save(nib.Nifti1Image(pred,im.affine,h),out/f'pancreas_{case}.nii.gz');print('Predicted full volume',case,flush=True)

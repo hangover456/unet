@@ -34,7 +34,7 @@ $env:TASK07_PYTHON = '你的GPU环境\python.exe'
 
 ## 两个实现的具体含义
 
-U-Net 仓库保留原 Keras 代码，新增 `task07_demo/model.py` 的 PyTorch U-Net。四次下采样、跳跃连接、四次上采样、三类输出；起始通道由旧版 64 缩为 32，上采样采用 nearest + 3×3 卷积，使用 CE + foreground soft Dice。它是针对 Task07/4GB GPU 的适配实现，不兼容旧 Keras 权重。预处理采用固定 HU 窗 [-100,240] 和线性归一化，每例最多缓存 32 张前景切片与 16 张背景切片。仅训练/验证采样使用标签；预测遍历整卷全部切片，不用真值裁剪。
+U-Net 仓库保留原 Keras 代码，新增 `task07_demo/model.py` 的 PyTorch U-Net。四次下采样、跳跃连接、四次上采样、三类输出；起始通道由旧版 64 缩为 32，上采样采用 nearest + 3×3 卷积，使用 CE + foreground soft Dice。训练、验证和预测均使用 FP32；Adam 学习率为 `1e-4`，梯度范数上限为 1，非有限损失/梯度会在更新前报错。它是针对 Task07/4GB GPU 的适配实现，不兼容旧 Keras 权重。预处理采用固定 HU 窗 [-100,240] 和线性归一化，每例最多缓存 32 张前景切片与 16 张背景切片。仅训练/验证采样使用标签；预测遍历整卷全部切片，不用真值裁剪。
 
 nnU-Net 使用仓库真实的 fingerprint、planner、preprocessor、数据增强、网络、损失与优化器。只新增 `nnUNetTrainerTask07Demo`，限制时间预算；2D plan 的 patch/batch 明确调整为 256×256/2。fingerprint、spacing 和归一化统计仅来自 8 个训练病例；另外 2 个验证病例用相同统计预处理，2 个测试病例不参与训练与规划。该配置不是默认五折/1000 epoch 的标准 nnU-Net 基准。
 
@@ -80,6 +80,12 @@ U-Net 权重在运行目录下，nnU-Net 权重在该运行的 `results/` 子目
 `predict`/`collect` 默认读取该模型最新运行目录；也可加 `--run-dir '某次运行目录'`。若训练失败，不会冒充完成；错误状态和日志保存在运行目录。修复后可新建一次运行，已完成预处理可复用。不自动恢复中断的优化器状态。按 Ctrl+C 会保留已存在的 checkpoint，并尽可能保存 interrupted checkpoint。
 
 若显存不足，关闭其他 GPU 程序再运行；本次已经按 batch 2/256 patch 做真实 CUDA 短测试。训练时保持接通电源、禁止系统睡眠。
+
+### 旧版 U-Net 的 Non-finite training loss
+
+初版 FP16/Adam `1e-3` 在真实训练第 239 个 batch 复现了前向溢出；同一批输入和权重改为 FP32 后损失有限。当前已改为 FP32 和较低学习率，并检查验证/预测输出、训练梯度。原始失败目录保留，重新执行同一启动命令会新建运行目录并复用已有预处理，无需删除数据或缓存，也不加载失败运行的权重。
+
+训练设置另存 `training_settings.json`，每轮梯度范数记录在 `history.json`，以便核验实际精度和稳定性设置。
 
 ## 快速复查
 
